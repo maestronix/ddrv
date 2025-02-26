@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"log"
+	"time"
 )
 
 // ErrClosed is returned when a writer or reader is
@@ -85,22 +87,36 @@ func (mgr *Manager) NewReader(chunks []Attachment, pos int64) (io.ReadCloser, er
 // read fetches a range of data from the specified URL.
 // The range is specified by the start and end positions.
 func (mgr *Manager) read(url string, start, end int) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(mgr.traceCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	// Set the Range header to specify the range of data to fetch
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+    refreshedURL := fmt.Sprintf("https://api.animemoe.us/discord/refresh?url=%s", url)
+    log.Printf("read: Refreshing URL %s to %s", url, refreshedURL)
 
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("read attachment : expected code %d but received %d", http.StatusPartialContent, res.StatusCode)
-	}
-	// Return the body of the response, which contains the requested data
-	return res.Body, nil
+    client := &http.Client{Timeout: 10 * time.Second}
+    for attempt := 1; attempt <= 3; attempt++ {
+        req, err := http.NewRequestWithContext(mgr.traceCtx, http.MethodGet, refreshedURL, nil)
+        if err != nil {
+            log.Printf("read: Error creating request for %s: %v", refreshedURL, err)
+            return nil, err
+        }
+        req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+        log.Printf("read: Attempt %d for %s", attempt, refreshedURL)
+        res, err := client.Do(req)
+        if err == nil && res.StatusCode == http.StatusPartialContent {
+            log.Printf("read: Successfully fetched %s", refreshedURL)
+            return res.Body, nil
+        }
+        if err != nil {
+            log.Printf("read: Error fetching %s on attempt %d: %v", refreshedURL, attempt, err)
+        } else {
+            log.Printf("read: Unexpected status %d for %s on attempt %d", res.StatusCode, refreshedURL, attempt)
+            res.Body.Close()
+        }
+        if attempt < 3 {
+            time.Sleep(time.Duration(attempt) * time.Second)
+        }
+    }
+    log.Printf("read: Failed to fetch %s after 3 attempts", refreshedURL)
+    return nil, fmt.Errorf("read: failed to fetch %s after 3 attempts", refreshedURL)
 }
 
 // write created new attachment on Discord with provided Reader,
