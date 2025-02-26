@@ -1,33 +1,37 @@
 package ddrv
 
-import "io"
+import (
+	"io"
+	"log"
+	"fmt"
+)
 
 // Reader is a structure that manages the reading of a sequence of Chunks.
-// It reads chunks in order, closing each one after it's Read and moving on to the next.
+// It reads chunks in order, closing each one after it's read and moving on to the next.
 type Reader struct {
-	chunks []Attachment  // The sequence of chunks to be Read.
-	curIdx int           // Index of the chunk that is currently being Read.
+	chunks []Attachment  // The sequence of chunks to be read.
+	curIdx int           // Index of the chunk that is currently being read.
 	closed bool          // Indicates whether the Reader has been closed.
 	disc   *Manager      // Manager object provides access to the chunks.
 	reader io.ReadCloser // The reader that is reading the current chunk.
-	pos    int64
+	pos    int64         // Global file offset
 }
 
 // NewReader creates new Reader instance which implements io.ReadCloser.
 func NewReader(chunks []Attachment, pos int64, arc *Manager) (io.ReadCloser, error) {
 	r := &Reader{chunks: chunks, pos: pos, disc: arc}
-	// Calculate Start and End for each part
+	// Calculate Start and End for each chunk
 	var offset int64
 	for i := range r.chunks {
-		r.chunks[i].Start = offset                             // 0
-		r.chunks[i].End = offset + int64(r.chunks[i].Size) - 1 // 9
+		r.chunks[i].Start = offset                             // Start offset for chunk i
+		r.chunks[i].End = offset + int64(r.chunks[i].Size) - 1 // End offset (inclusive)
 		offset = r.chunks[i].End + 1
 	}
-	// If pos > size means file is ended
+	// If pos > total size, return EOF
 	if r.pos > offset {
 		return nil, io.EOF
 	}
-	// Find starting chunk and drop all the chunks that are completely before 'pos'
+	// Find starting chunk and drop all chunks completely before 'pos'
 	var start int
 	for i, chunk := range r.chunks {
 		start += chunk.Size
@@ -37,19 +41,18 @@ func NewReader(chunks []Attachment, pos int64, arc *Manager) (io.ReadCloser, err
 			break
 		}
 	}
-
+	log.Printf("NewReader: Starting at global offset %d in chunk 0", r.pos)
 	return r, nil
 }
 
 // Read reads data from the current chunk into p.
 // If it reaches the end of a chunk, it moves to the next one.
-// It reads until p is full or there are no more chunks to Read from.
 func (r *Reader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, ErrClosed
 	}
-	// Handle files with zero length
-	if 0 == len(r.chunks) {
+	// Handle empty file case
+	if len(r.chunks) == 0 {
 		return 0, io.EOF
 	}
 	if r.reader == nil {
@@ -61,15 +64,20 @@ func (r *Reader) Read(p []byte) (int, error) {
 	for {
 		nr, err := r.reader.Read(p[totalRead:])
 		totalRead += nr
-
+		// **Wichtig:** Update des globalen Offsets
+		r.pos += int64(nr)
+		
 		if err == io.EOF {
+			log.Printf("Read: Finished chunk %d, totalRead so far: %d bytes", r.curIdx, totalRead)
 			r.curIdx++
 			if r.curIdx >= len(r.chunks) {
-				return totalRead, err
+				return totalRead, io.EOF
 			}
 			if err = r.next(); err != nil {
 				return totalRead, err
 			}
+			// Versuche, weiter zu lesen
+			continue
 		}
 
 		if err != nil && err != io.EOF {
@@ -82,16 +90,20 @@ func (r *Reader) Read(p []byte) (int, error) {
 	}
 }
 
-// Close implements the Close method of io.Closer. It closes the Reader.
-// If the Reader is already closed, Close returns ErrAlreadyClosed.
+// Close closes the Reader.
 func (r *Reader) Close() error {
 	if r.closed {
 		return ErrAlreadyClosed
 	}
 	if r.reader != nil {
-		_ = r.reader.Close()
+		if err := r.reader.Close(); err != nil {
+			log.Printf("Reader.Close: Error closing current chunk reader: %v", err)
+			return err
+		}
+		log.Printf("Reader.Close: Closed current chunk reader.")
 	}
 	r.closed = true
+	log.Printf("Reader.Close: Reader closed successfully.")
 	return nil
 }
 
@@ -103,18 +115,16 @@ func (r *Reader) next() error {
 		}
 	}
 	chunk := r.chunks[r.curIdx]
-
-	// Find start byte in range header here
+	// Berechne den relativen Startoffset in diesem Chunk:
 	var start int
 	if r.pos > chunk.Start {
 		start = int(r.pos - chunk.Start)
 	}
-
+	log.Printf("next: Starting new reader for chunk %d at relative offset %d (global pos: %d, chunk start: %d)", r.curIdx, start, r.pos, chunk.Start)
 	reader, err := r.disc.read(chunk.URL, start, chunk.Size-1)
 	if err != nil {
-		return err
+		return fmt.Errorf("next: failed to create reader for chunk %d: %w", r.curIdx, err)
 	}
 	r.reader = reader
-
 	return nil
 }
