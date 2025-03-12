@@ -31,9 +31,8 @@ type Attachment struct {
 	End   int64  // End position of the data in the overall data sequence
 }
 
-// Manager provides an interface to read and write large files to Discord by splitting the files into
-// smaller chunks, uploading or downloading these chunks through an external refresh API, and reassembling
-// them into the original files.
+// Manager provides an interface to read and write large files by splitting them into smaller chunks,
+// refreshing the chunk URLs via an external API, and reassembling them.
 type Manager struct {
 	chunkSize int             // Size of each chunk of data to be processed
 	webhooks  []string        // List of webhook URLs (unused im Refresh-Kontext)
@@ -44,6 +43,7 @@ type Manager struct {
 }
 
 // NewManager returns a new instance of Manager with specified chunk size and webhook URLs.
+// It initializes a list of webhook rest clients for each webhook URL.
 func NewManager(chunkSize int, webhooks []string) (*Manager, error) {
 	st := &Manager{
 		chunkSize: chunkSize,
@@ -65,30 +65,84 @@ func NewManager(chunkSize int, webhooks []string) (*Manager, error) {
 	return st, nil
 }
 
-// refreshPayload ist die Struktur für den API-Payload.
+// NewWriter creates a new ddrv.Writer instance that implements an io.WriterCloser.
+func (mgr *Manager) NewWriter(onChunk func(chunk *Attachment)) io.WriteCloser {
+	return NewWriter(onChunk, mgr.chunkSize, mgr)
+}
+
+// NewNWriter creates a new ddrv.NWriter instance that implements an io.WriterCloser.
+func (mgr *Manager) NewNWriter(onChunk func(chunk *Attachment)) io.WriteCloser {
+	return NewNWriter(onChunk, mgr.chunkSize, mgr)
+}
+
+// NewReader creates a new Reader instance that implements an io.ReadCloser.
+func (mgr *Manager) NewReader(chunks []Attachment, pos int64) (io.ReadCloser, error) {
+	return NewReader(chunks, pos, mgr)
+}
+
+// read fetches a range of data from the specified URL.
+// It assumes the URL is already refreshed.
+func (mgr *Manager) read(url string, start, end int) (io.ReadCloser, error) {
+	log.Printf("read: Using URL %s for range bytes=%d-%d", url, start, end)
+	req, err := http.NewRequestWithContext(mgr.traceCtx, http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("read: Error creating request for %s: %v", url, err)
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("read: Error executing request for %s: %v", url, err)
+		return nil, err
+	}
+	if res.StatusCode != http.StatusPartialContent {
+		log.Printf("read: Unexpected status %d for %s", res.StatusCode, url)
+		res.Body.Close()
+		return nil, fmt.Errorf("read: expected status %d but received %d", http.StatusPartialContent, res.StatusCode)
+	}
+	log.Printf("read: Successfully fetched data from %s", url)
+	return res.Body, nil
+}
+
+// write creates a new attachment using the provided Reader.
+func (mgr *Manager) write(r io.Reader) (*Attachment, error) {
+	client := mgr.next()
+	return client.CreateAttachment(r)
+}
+
+// next returns the next webhook client in round-robin fashion.
+func (mgr *Manager) next() *Rest {
+	mgr.mu.Lock()
+	client := mgr.clients[mgr.lastCIdx]
+	mgr.lastCIdx = (mgr.lastCIdx + 1) % len(mgr.clients)
+	mgr.mu.Unlock()
+	return client
+}
+
+// --- Refresh functionality for parallel chunk URL updating ---
+
 type refreshPayload struct {
 	AttachmentURLs []string `json:"attachment_urls"`
 }
 
-// refreshResponse repräsentiert die API-Antwort.
 type refreshResponse struct {
 	RefreshedURLs []struct {
 		Refreshed string `json:"refreshed"`
 	} `json:"refreshed_urls"`
 }
 
-// refreshJob repräsentiert einen Job zum Refreshen eines Chunk-URLs.
+// refreshJob represents a job to refresh a single chunk URL.
 type refreshJob struct {
-	url          string // Ursprüngliche URL aus der DB.
-	start        int    // Start-Byte (z.B. 0)
-	end          int    // End-Byte (z.B. node.Size - 1)
-	refreshedURL string // Hier wird der aktualisierte URL gespeichert.
+	url          string // Original URL from the DB.
+	start        int    // Start byte (e.g., 0).
+	end          int    // End byte (e.g., node.Size - 1).
+	refreshedURL string // Will store the new, refreshed URL.
 }
 
-// refreshURL führt den Refresh-Vorgang für eine einzelne URL durch.
-// Es wird ein POST-Request an die API geschickt, die als Antwort den neuen URL liefert.
+// refreshURL sends a POST request to the refresh API and returns the new URL.
 func (mgr *Manager) refreshURL(url string, start, end int) (string, error) {
-	// Erstelle den Payload. In diesem Beispiel ignorieren wir start/end.
 	payload := refreshPayload{
 		AttachmentURLs: []string{url},
 	}
@@ -98,7 +152,7 @@ func (mgr *Manager) refreshURL(url string, start, end int) (string, error) {
 		return "", err
 	}
 
-	// API-Endpunkt: Beachte, dass hier kein Bot-Token benötigt wird.
+	// API endpoint (keine Authentifizierung erforderlich)
 	refreshAPI := "https://api.animemoe.us/discord/refresh"
 	req, err := http.NewRequest(http.MethodPost, refreshAPI, bytes.NewReader(jsonPayload))
 	if err != nil {
@@ -140,7 +194,7 @@ func (mgr *Manager) refreshURL(url string, start, end int) (string, error) {
 	return "", fmt.Errorf("refreshURL: failed to refresh URL %s after 3 attempts", url)
 }
 
-// refreshChunks nimmt ein Slice von refreshJob und aktualisiert alle URLs parallel mithilfe eines Worker-Pools.
+// refreshChunks processes a slice of refreshJob in parallel using a worker pool.
 func (mgr *Manager) refreshChunks(jobs []refreshJob) error {
 	const maxWorkers = 10
 	jobChan := make(chan *refreshJob, len(jobs))
@@ -159,13 +213,11 @@ func (mgr *Manager) refreshChunks(jobs []refreshJob) error {
 		}
 	}
 
-	// Starte maxWorkers Worker.
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
 		go worker()
 	}
 
-	// Sende Zeiger auf alle Jobs in den Channel.
 	for i := range jobs {
 		jobChan <- &jobs[i]
 	}
