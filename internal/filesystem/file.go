@@ -234,16 +234,40 @@ func (f *File) Close() error {
 }
 
 func (f *File) openReadStream(startAt int64) error {
-    chunks := make([]ddrv.Attachment, len(f.data))
-    for i, node := range f.data {
-        chunks[i] = ddrv.Attachment{URL: node.URL, Size: node.Size}
-    }
-    stream, err := f.mgr.NewReader(chunks, startAt)
-    if err != nil {
-        return err
-    }
-    f.streamRead = stream
-    return nil
+	// Erzeuge ein Attachment-Slice aus f.data und gleichzeitig ein Slice von refreshJobs.
+	chunks := make([]ddrv.Attachment, len(f.data))
+	var jobs []refreshJob
+	for i, node := range f.data {
+		chunks[i] = ddrv.Attachment{URL: node.URL, Size: node.Size}
+		jobs = append(jobs, refreshJob{
+			url:   node.URL,
+			start: 0,             // Hier ggf. dynamisch anpassen
+			end:   node.Size - 1, // Endoffset
+		})
+	}
+
+	log.Printf("openReadStream: Refreshing %d chunk URLs in parallel", len(jobs))
+	if err := f.mgr.refreshChunks(jobs); err != nil {
+		log.Printf("openReadStream: error refreshing chunk URLs: %v", err)
+		return err
+	}
+
+	// Aktualisiere die Attachment-Slice mit den neuen, refreshed URLs.
+	for i, job := range jobs {
+		if job.refreshedURL != "" {
+			chunks[i].URL = job.refreshedURL
+		}
+	}
+
+	// Erzeuge den Reader mit den aktualisierten Chunk-URLs.
+	stream, err := f.mgr.NewReader(chunks, startAt)
+	if err != nil {
+		log.Printf("openReadStream: error creating reader: %v", err)
+		return err
+	}
+	f.streamRead = stream
+	log.Printf("openReadStream: Reader started successfully at offset %d", startAt)
+	return nil
 }
 
 func convertToNode(chunk *ddrv.Attachment) *dataprovider.Node {
