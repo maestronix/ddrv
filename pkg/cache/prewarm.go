@@ -144,9 +144,11 @@ func Prewarm(provider dataprovider.Provider) {
 
 	// Atomarer Swap des globalen Caches
 	GlobalCache.Mu.Lock()
+	log.Printf("acquiring Lock to swap cache")
 	GlobalCache.Nodes = newNodes
 	GlobalCache.Files = newFiles
 	GlobalCache.Mu.Unlock()
+	log.Printf("unlocked, cache swap complete")
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
