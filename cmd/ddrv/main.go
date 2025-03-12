@@ -11,6 +11,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/forscht/ddrv/internal/config"
+	"github.com/forscht/ddrv/internal/dataprovider"
 	"github.com/forscht/ddrv/internal/filesystem"
 	"github.com/forscht/ddrv/internal/ftp"
 	"github.com/forscht/ddrv/internal/http"
@@ -37,9 +38,12 @@ func main() {
 		log.Fatalf("ddrv: failed to open ddrv mgr: %v", err)
 	}
 
-	// Erzeuge das Backend-Filesystem, das intern dataprovider.New() aufruft
+	// Initialisiere den Provider (globaler Provider wird in dataprovider.New() gesetzt)
+	dataprovider.New()
+
+	// Erzeuge das Backend-Filesystem, das intern dataprovider.New() verwendet
 	backend := filesystem.New(mgr)
-	// Übergebe ein valides Backend an das CacheFs
+	// Übergebe ein valides Backend an CacheFs (statt nil)
 	fs := cache.NewCacheFs(mgr, backend)
 
 	// Starte den Prewarm-Prozess einmalig beim Start

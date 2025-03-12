@@ -1,0 +1,335 @@
+package ftp
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	ftpserver "github.com/fclairamb/ftpserverlib"
+	"github.com/spf13/afero"
+
+	"github.com/forscht/ddrv/internal/config"
+)
+
+const IPResolveURL = "https://ipinfo.io/ip"
+
+// Error definitions
+var (
+	ErrNoTLS                 = errors.New("TLS is not configured")
+	ErrBadUserNameOrPassword = errors.New("bad username or password")
+)
+
+var (
+	cachedIP   string
+	cachedTime time.Time
+	cacheMutex sync.Mutex
+)
+
+// BalancedRWMutex ist ein fairer RWMutex, der verhindert, dass Schreiber dauerhaft blockiert werden.
+// Nach maxConsecutiveReaders aufeinanderfolgenden Lesezugriffen (wenn auch Schreiber warten)
+// werden keine neuen Leser zugelassen, bis ein wartender Schreiber durchkommt.
+type BalancedRWMutex struct {
+	mutex                 sync.Mutex
+	readers               int
+	writerActive          bool
+	waitingWriters        int
+	consecutiveReaders    int
+	maxConsecutiveReaders int
+	cond                  *sync.Cond
+}
+
+func NewBalancedRWMutex(maxConsecutive int) *BalancedRWMutex {
+	brw := &BalancedRWMutex{
+		maxConsecutiveReaders: maxConsecutive,
+	}
+	brw.cond = sync.NewCond(&brw.mutex)
+	return brw
+}
+
+func (brw *BalancedRWMutex) RLock() {
+	brw.mutex.Lock()
+	// Wenn ein Writer aktiv ist oder wenn Writer warten und wir schon max consecutives Lesen erreicht haben,
+	// dann blockiere neue Leser.
+	for brw.writerActive || (brw.waitingWriters > 0 && brw.consecutiveReaders >= brw.maxConsecutiveReaders) {
+		brw.cond.Wait()
+	}
+	brw.readers++
+	brw.consecutiveReaders++
+	brw.mutex.Unlock()
+}
+
+func (brw *BalancedRWMutex) RUnlock() {
+	brw.mutex.Lock()
+	brw.readers--
+	if brw.readers == 0 {
+		brw.cond.Signal()
+	}
+	brw.mutex.Unlock()
+}
+
+func (brw *BalancedRWMutex) Lock() {
+	brw.mutex.Lock()
+	brw.waitingWriters++
+	// Warte, bis keine Leser und kein aktiver Writer da sind.
+	for brw.writerActive || brw.readers > 0 {
+		brw.cond.Wait()
+	}
+	brw.waitingWriters--
+	brw.writerActive = true
+	// Reset der consecutiven Leser, damit nach dem Schreiben wieder Leser zugelassen werden.
+	brw.consecutiveReaders = 0
+	brw.mutex.Unlock()
+}
+
+func (brw *BalancedRWMutex) Unlock() {
+	brw.mutex.Lock()
+	brw.writerActive = false
+	// Wecke alle wartenden Prozesse (sowohl Leser als auch Schreiber).
+	brw.cond.Broadcast()
+	brw.mutex.Unlock()
+}
+
+// fileInfoWrapper wraps os.FileInfo to satisfy the ftpserver.FileInfo interface.
+// Da ftpserver.FileInfo nicht definiert ist, nutzen wir os.FileInfo direkt.
+type fileInfoWrapper struct {
+	os.FileInfo
+}
+
+// FSClientDriver is a wrapper around afero.Fs that implements the ftpserver.ClientDriver interface.
+// Er implementiert alle Methoden, die auch im afero.Fs-Interface vorhanden sind.
+type FSClientDriver struct {
+	Fs       afero.Fs
+	rwMutex  *NewBalancedRWMutex
+	writeSem chan struct{}
+}
+
+func NewFSClientDriver(fs afero.Fs) *FSClientDriver {
+	return &FSClientDriver{
+		Fs:       fs,
+		rwMutex:  NewBalancedRWMutex(10), // nach 10 Lesezugriffen wird ein Schreiber bevorzugt, falls einer wartet
+		writeSem: make(chan struct{}, 10), // weiterhin maximal 10 parallele Schreiboperationen
+	}
+}
+
+// --- Read operations (protected by RLock) ---
+
+func (d *FSClientDriver) ChangeDirectory(path string) error {
+	d.rwMutex.RLock()
+	defer d.rwMutex.RUnlock()
+	fi, err := d.Fs.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return os.ErrInvalid
+	}
+	return nil
+}
+
+func (d *FSClientDriver) ListFiles(path string, callback func(os.FileInfo) error) error {
+	d.rwMutex.RLock()
+	defer d.rwMutex.RUnlock()
+	files, err := afero.ReadDir(d.Fs, path)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if err := callback(file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OpenFile returns an afero.File (not just an io.ReadWriteCloser)
+func (d *FSClientDriver) OpenFile(path string, flag int, perm os.FileMode) (afero.File, error) {
+	d.rwMutex.RLock()
+	defer d.rwMutex.RUnlock()
+	return d.Fs.OpenFile(path, flag, perm)
+}
+
+func (d *FSClientDriver) Stat(path string) (os.FileInfo, error) {
+	d.rwMutex.RLock()
+	defer d.rwMutex.RUnlock()
+	return d.Fs.Stat(path)
+}
+
+func (d *FSClientDriver) Open(name string) (afero.File, error) {
+	d.rwMutex.RLock()
+	defer d.rwMutex.RUnlock()
+	return d.Fs.Open(name)
+}
+
+// --- Write operations (protected by writeSem) ---
+
+func (d *FSClientDriver) Create(name string) (afero.File, error) {
+	d.writeSem <- struct{}{}
+	defer func() { <-d.writeSem }()
+	return d.Fs.Create(name)
+}
+
+func (d *FSClientDriver) Mkdir(name string, perm os.FileMode) error {
+	d.writeSem <- struct{}{}
+	defer func() { <-d.writeSem }()
+	return d.Fs.Mkdir(name, perm)
+}
+
+func (d *FSClientDriver) MkdirAll(path string, perm os.FileMode) error {
+	d.writeSem <- struct{}{}
+	defer func() { <-d.writeSem }()
+	return d.Fs.MkdirAll(path, perm)
+}
+
+func (d *FSClientDriver) Remove(name string) error {
+	d.writeSem <- struct{}{}
+	defer func() { <-d.writeSem }()
+	return d.Fs.Remove(name)
+}
+
+func (d *FSClientDriver) RemoveAll(path string) error {
+	d.writeSem <- struct{}{}
+	defer func() { <-d.writeSem }()
+	return d.Fs.RemoveAll(path)
+}
+
+func (d *FSClientDriver) Rename(oldPath, newPath string) error {
+//	d.writeSem <- struct{}{}
+//	defer func() { <-d.writeSem }()
+	return d.Fs.Rename(oldPath, newPath)
+}
+
+// --- Additional methods required by ftpserver.ClientDriver ---
+// Da afero.Fs diese Funktionen nicht unterstützt, geben wir Fehler zurueck.
+
+func (d *FSClientDriver) Chmod(path string, mode os.FileMode) error {
+	return errors.New("Chmod not supported")
+}
+
+func (d *FSClientDriver) Chown(path string, uid, gid int) error {
+	return errors.New("Chown not supported")
+}
+
+func (d *FSClientDriver) Chtimes(path string, atime, mtime time.Time) error {
+    // Kein Update der Zeiten, einfach Erfolg melden
+    return nil
+}
+
+// Name returns a constant name for this driver.
+func (d *FSClientDriver) Name() string {
+	return "FSClientDriver"
+}
+
+// --- End of FSClientDriver ---
+
+// Driver implements the FTP server driver.
+type Driver struct {
+	Fs       afero.Fs            // The file system to serve over FTP
+	Debug    bool                // Debug mode flag
+	Settings *ftpserver.Settings // FTP server settings
+	username string              // Username for authentication
+	password string              // Password for authentication
+}
+
+// New creates a new FTP server instance.
+func New(fs afero.Fs) *ftpserver.FtpServer {
+	addr := config.FTPAddr()
+	ptr := config.FTPPortRange()
+	username := config.Username()
+	password := config.Password()
+
+	var portRange *ftpserver.PortRange
+	if ptr != "" {
+		portRange = &ftpserver.PortRange{}
+		if _, err := fmt.Sscanf(ptr, "%d-%d", &portRange.Start, &portRange.End); err != nil {
+			log.Fatalf("bad ftp port range %v", err)
+		}
+	}
+
+	driver := &Driver{
+		Fs:       fs,
+		username: username,
+		password: password,
+		Settings: &ftpserver.Settings{
+			ListenAddr:          addr,
+			DefaultTransferType: ftpserver.TransferTypeBinary,
+			IdleTimeout:         86400, // 24 hours
+		},
+	}
+
+	if portRange != nil {
+		driver.Settings.PassiveTransferPortRange = portRange
+
+		// PublicIPResolver with caching and timeout
+		driver.Settings.PublicIPResolver = func(ctx ftpserver.ClientContext) (string, error) {
+			cacheMutex.Lock()
+			if time.Since(cachedTime) < 60*time.Minute && cachedIP != "" {
+				ip := cachedIP
+				cacheMutex.Unlock()
+				return ip, nil
+			}
+			cacheMutex.Unlock()
+
+			reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, IPResolveURL, nil)
+			if err != nil {
+				return "", err
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return "", err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return "", err
+			}
+			ip := strings.TrimSpace(string(body))
+			cacheMutex.Lock()
+			cachedIP = ip
+			cachedTime = time.Now()
+			cacheMutex.Unlock()
+			return ip, nil
+		}
+	}
+
+	server := ftpserver.NewFtpServer(driver)
+	return server
+}
+
+func (d *Driver) ClientConnected(cc ftpserver.ClientContext) (string, error) {
+	log.Printf("new conn - addr:%s id: %d", cc.RemoteAddr(), cc.ID())
+	return "Ditto FTP Server", nil
+}
+
+func (d *Driver) ClientDisconnected(cc ftpserver.ClientContext) {
+	log.Printf("lost conn - addr:%s id: %d", cc.RemoteAddr(), cc.ID())
+}
+
+// AuthUser authenticates a user and returns an FSClientDriver that implements the required interface.
+func (d *Driver) AuthUser(_ ftpserver.ClientContext, user, pass string) (ftpserver.ClientDriver, error) {
+	if (d.username != "" && d.username != user) || (d.password != "" && d.password != pass) {
+		return nil, ErrBadUserNameOrPassword
+	}
+	return NewFSClientDriver(d.Fs), nil
+}
+
+func (d *Driver) GetSettings() (*ftpserver.Settings, error) {
+	return d.Settings, nil
+}
+
+func (d *Driver) GetTLSConfig() (*tls.Config, error) {
+	return nil, ErrNoTLS
+}
